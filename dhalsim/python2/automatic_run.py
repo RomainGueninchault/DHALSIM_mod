@@ -77,6 +77,7 @@ class GeneralCPS(MiniCPS):
 
         self.plc_processes = None
         self.scada_process = None
+        self.hmi_process = None
         self.plant_process = None
         self.attacker_processes = None
         self.network_event_processes = None
@@ -127,6 +128,20 @@ class GeneralCPS(MiniCPS):
         self.router_processes.append(node.popen(cmd, stderr=sys.stderr, stdout=sys.stdout))
 
         self.logger.info("Launched the SCADA process.")
+
+        # Launch HMI process (level 2, same pattern as SCADA)
+        automatic_hmi_path = Path(__file__).parent.absolute() / "automatic_hmi.py"
+        hmi_cmd = ["python3", str(automatic_hmi_path), str(self.intermediate_yaml)]
+        self.hmi_process = self.net.get('hmi').popen(hmi_cmd, stderr=sys.stderr, stdout=sys.stdout)
+
+        # Launch router for HMI only if distinct from SCADA router (complex topo)
+        # In simple topo both share r0 which is already spawned above
+        if self.data['hmi']['gateway_name'] != self.data['scada']['gateway_name']:
+            node = self.net.get(self.data['hmi']['gateway_name'])
+            cmd = ["python3", str(automatic_router_path), str(self.intermediate_yaml), str(self.data['hmi']['gateway_name'])]
+            self.router_processes.append(node.popen(cmd, stderr=sys.stderr, stdout=sys.stdout))
+
+        self.logger.info("Launched the HMI process.")
 
         self.attacker_processes = []
         if "network_attacks" in self.data:
@@ -189,6 +204,7 @@ class GeneralCPS(MiniCPS):
         processes.extend(self.attacker_processes)
         processes.extend(self.router_processes)
         processes.append(self.scada_process)
+        processes.append(self.hmi_process)
         processes.append(self.plant_process)
 
         # We wait until the simulation ends
@@ -231,6 +247,12 @@ class GeneralCPS(MiniCPS):
                 self.end_process(self.scada_process, self.PROCESS_TIMEOUT)
             except Exception as msg:
                 self.logger.error("Exception shutting down SCADA: " + str(msg))
+
+        if self.hmi_process and self.hmi_process.poll() is None:
+            try:
+                self.end_process(self.hmi_process, self.PROCESS_TIMEOUT)
+            except Exception as msg:
+                self.logger.error("Exception shutting down HMI: " + str(msg))
 
         for plc_process in self.plc_processes:
             if plc_process.poll() is None:

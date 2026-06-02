@@ -52,7 +52,6 @@ class GenericScada(BasePLC):
     PLC_UPDATE_TIMEOUT_TICKS_NUMBER = 29
     """ Number of ticks to wait for PLC update"""
 
-
     def __init__(self, intermediate_yaml_path):
         with intermediate_yaml_path.open() as yaml_file:
             self.intermediate_yaml = yaml.load(yaml_file, Loader=yaml.FullLoader)
@@ -81,7 +80,7 @@ class GenericScada(BasePLC):
         }
 
         # Simple data has PLC tags, without the index (T101, 1) becomes T101
-        self.plc_data, self.simple_plc_data  = self.generate_plcs()
+        self.plc_data, self.simple_plc_data = self.generate_plcs()
 
         for PLC in self.intermediate_yaml['plcs']:
             if 'sensors' not in PLC:
@@ -96,7 +95,6 @@ class GenericScada(BasePLC):
         columns_list = ['iteration', 'timestamp']
         columns_list.extend(self.get_scada_tags())
 
-
         self.cache = pd.DataFrame(columns=columns_list)
         self.cache.loc[0] = 0
 
@@ -107,6 +105,19 @@ class GenericScada(BasePLC):
             self.updated_plc[ip] = False
 
         self.scada_run = True
+
+        # Map: actuator_tag -> plc public_ip (for relay)
+        self.actuator_to_plc_ip = {}
+        for plc in self.intermediate_yaml['plcs']:
+            for actuator in plc.get('actuators', []):
+                if actuator:
+                    self.actuator_to_plc_ip[actuator] = plc['public_ip']
+
+        # Pending HMI commands — populated by the HMI via ENIP writes on SCADA tags
+        # Flushed to PLCs at each sync iteration (flag=2 phase)
+        # Structure: list of (tag, value, plc_ip)
+        self.pending_hmi_commands = []
+        self.pending_hmi_lock = threading.Lock()  # initialised here, safe to use from pre_loop
 
         self.do_super_construction(scada_protocol, state)
 
@@ -123,14 +134,14 @@ class GenericScada(BasePLC):
 
             # We were having ordering issues by adding it as a set. Probably could be done in a more pythonic way
             if 'sensors' in PLC:
-                    for sensor in PLC['sensors']:
-                        if sensor not in aux_scada_tags:
-                            aux_scada_tags.append(sensor)
-                            
+                for sensor in PLC['sensors']:
+                    if sensor not in aux_scada_tags:
+                        aux_scada_tags.append(sensor)
+
             if 'actuators' in PLC:
-                    for actuator in PLC['actuators']:
-                        if actuator not in aux_scada_tags:
-                            aux_scada_tags.append(actuator)
+                for actuator in PLC['actuators']:
+                    if actuator not in aux_scada_tags:
+                        aux_scada_tags.append(actuator)
 
         # self.logger.debug('SCADA tags: ' + str(aux_scada_tags))
         return aux_scada_tags
@@ -156,6 +167,8 @@ class GenericScada(BasePLC):
             for actuator in plc['actuators']:
                 if actuator != "":
                     real_tags.append((actuator, 1, 'REAL'))
+                    # Dedicated HMI command tag — neutral value is -1
+                    real_tags.append((actuator + '_CMD', 1, 'REAL'))
 
         return tuple(real_tags)
 
@@ -187,6 +200,17 @@ class GenericScada(BasePLC):
 
         self.keep_updating_flag = True
         self.cache_update_process = None
+
+        # Initialise tous les tags _CMD à -1 (valeur neutre)
+        # Les tags _CMD sont dans le serveur cpppo, pas dans SQLite
+        # -> on utilise self.send() vers notre propre IP locale
+        scada_local_ip = self.intermediate_yaml['scada']['local_ip']
+        for actuator in self.actuator_to_plc_ip:
+            try:
+                self.send((actuator + '_CMD', 1), -1.0, scada_local_ip)
+            except Exception as exc:
+                self.logger.warning('Could not init CMD tag {t}: {e}'.format(
+                    t=actuator + '_CMD', e=exc))
 
         time.sleep(sleep)
 
@@ -268,7 +292,7 @@ class GenericScada(BasePLC):
         """
         Writes the csv output of the scada
         """
-        results = self.cache        
+        results = self.cache
         results.to_csv(self.output_path, index=False)
 
     def generate_plcs(self):
@@ -320,11 +344,11 @@ class GenericScada(BasePLC):
 
         while self.update_cache_flag:
             for plc_ip in self.plc_data:
-                try:                
-                    values = self.receive_multiple(self.plc_data[plc_ip], plc_ip)                    
+                try:
+                    values = self.receive_multiple(self.plc_data[plc_ip], plc_ip)
                     values_float = [float(x) for x in values]
                     if len(values_float) == len(self.simple_plc_data[plc_ip]):
-                        with lock: 
+                        with lock:
                             clock = int(self.get_master_clock())
                             self.cache.loc[clock, self.simple_plc_data[plc_ip]] = values_float
                             self.cache.loc[clock, 'iteration'] = clock
@@ -339,12 +363,64 @@ class GenericScada(BasePLC):
                     else:
                         return
 
-                #self.logger.debug(
+                # self.logger.debug(
                 #    "SCADA cache updated for {tags}, with value {values}, from {ip}".format(tags=self.plc_data[plc_ip],
                 #                                                                             values=values,
                 #                                                                             ip=plc_ip))
 
             time.sleep(cache_update_time)
+
+    def receive_hmi_commands(self):
+        """
+        Lit les tags _CMD sur le serveur ENIP du SCADA.
+        Si un tag MV101_CMD != -1, la HMI a écrit une commande.
+        On la met en queue et on remet le tag _CMD à -1 (valeur neutre).
+
+        La comparaison avec -1 est non ambiguë — aucun actuateur physique
+        ne peut avoir -1 comme valeur légitime.
+        """
+        scada_local_ip = self.intermediate_yaml['scada']['local_ip']
+        for actuator, plc_ip in self.actuator_to_plc_ip.items():
+            cmd_tag = actuator + '_CMD'
+            try:
+                # Lire depuis le serveur cpppo (pas SQLite) -> self.receive vers notre propre IP
+                cmd_value = float(self.receive((cmd_tag, 1), scada_local_ip))
+
+                if cmd_value != -1.0:
+                    # La HMI a écrit une commande — on la queue
+                    with self.pending_hmi_lock:
+                        self.pending_hmi_commands.append((actuator, cmd_value, plc_ip))
+                    self.logger.info(
+                        'SCADA queued HMI command: {tag}={val} -> {ip}'.format(
+                            tag=actuator, val=cmd_value, ip=plc_ip))
+                    # Remettre à -1 via self.send vers notre propre IP
+                    self.send((cmd_tag, 1), -1.0, scada_local_ip)
+
+            except Exception as exc:
+                self.logger.warning(
+                    'SCADA could not read CMD tag {tag}: {exc}'.format(
+                        tag=cmd_tag, exc=exc))
+
+    def flush_hmi_commands(self):
+        """
+        Relaie toutes les commandes HMI en attente vers leurs PLCs cibles via ENIP.
+        Appelé une fois par itération de sync, après receive_hmi_commands().
+        Vide la queue après envoi.
+        """
+        with self.pending_hmi_lock:
+            commands = list(self.pending_hmi_commands)
+            self.pending_hmi_commands.clear()
+
+        for tag, value, plc_ip in commands:
+            try:
+                self.send((tag, 1), value, plc_ip)
+                self.logger.info(
+                    'SCADA relayed HMI command: {tag}={val} to {ip}'.format(
+                        tag=tag, val=value, ip=plc_ip))
+            except Exception as exc:
+                self.logger.error(
+                    'SCADA failed to relay {tag}={val} to {ip}: {exc}'.format(
+                        tag=tag, val=value, ip=plc_ip, exc=exc))
 
     def get_plc_updated_flags(self):
         # self.logger.debug(self.updated_plc)
@@ -377,17 +453,17 @@ class GenericScada(BasePLC):
                                                      args=[lock, self.SCADA_CACHE_UPDATE_TIME], daemon=True)
                 self.cache_thread.start()
 
-                # Wait one scada update time 
+                # Wait one scada update time
                 time.sleep(self.SCADA_CACHE_UPDATE_TIME)
 
             for retry in range(self.PLC_UPDATE_TIMEOUT_TICKS_NUMBER):
-                if self.get_plc_updated_flags(): 
+                if self.get_plc_updated_flags():
                     break
                 else:
-                    # self.logger.debug(f'Waiting for plcs to be updated, tick {retry}')           
+                    # self.logger.debug(f'Waiting for plcs to be updated, tick {retry}')
                     time.sleep(self.PLC_UPDATE_TIMEOUT_TICK)
 
-            # self.logger.debug('Finished waiting')  
+            # self.logger.debug('Finished waiting')
             master_time = datetime.now()
             clock = int(self.get_master_clock())
             self.cache.loc[clock, 'timestamp'] = master_time
@@ -395,18 +471,24 @@ class GenericScada(BasePLC):
             for ip in self.plc_data:
                 if self.cache.loc[clock, self.simple_plc_data[ip]].isnull().any():
                     # If any PLC values are empty, use previous value
-                    self.cache.loc[clock, self.simple_plc_data[ip]] = self.cache.loc[clock-1, self.simple_plc_data[ip]]
+                    self.cache.loc[clock, self.simple_plc_data[ip]] = self.cache.loc[
+                        clock - 1, self.simple_plc_data[ip]]
                 self.updated_plc[ip] = False
 
             # Save scada_values.csv when needed
             if 'saving_interval' in self.intermediate_yaml and master_time != 0 and \
-                master_time % self.intermediate_yaml['saving_interval'] == 0:
+                    master_time % self.intermediate_yaml['saving_interval'] == 0:
                 self.write_output()
+
+            # Relay pending HMI commands to PLCs before closing this iteration
+            self.receive_hmi_commands()
+            self.flush_hmi_commands()
 
             self.set_sync(3)
 
             if test_break:
                 break
+
 
 def is_valid_file(parser_instance, arg):
     """

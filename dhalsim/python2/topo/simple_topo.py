@@ -111,6 +111,18 @@ class SimpleTopo(Topo):
         data['scada']['gateway_inbound_mac'] = self.supervisor_mac
         data['scada']['gateway_ip'] = self.supervisor_ip
 
+        # Generate HMI data — same supervisor network (s2) as SCADA, level 2 Purdue
+        data['hmi'] = {}
+        data['hmi']['name'] = "hmi"
+        data['hmi']['local_ip'] = "192.168.2.2"
+        data['hmi']['public_ip'] = "192.168.2.2"
+        data['hmi']['interface'] = "hmi-eth0"
+        data['hmi']['mac'] = 'AA:BB:CC:DD:06:01'
+        data['hmi']['switch_name'] = self.scada_switch
+        data['hmi']['gateway_name'] = self.router
+        data['hmi']['gateway_inbound_mac'] = self.supervisor_mac
+        data['hmi']['gateway_ip'] = self.supervisor_ip
+
         index = 1
 
         if 'plcs' in self.data.keys():
@@ -202,6 +214,12 @@ class SimpleTopo(Topo):
         # Add a link between the switch and the scada
         self.add_node_switch_link(scada, supervisor_switch, self.data['scada'])
 
+        # Add HMI to the supervisor network (level 2, same switch as SCADA)
+        hmi = self.addHost('hmi', ip=self.data['hmi']['local_ip'] + '/24',
+                           mac=self.data['hmi']['mac'],
+                           defaultRoute=supervisor_gateway)
+        self.add_node_switch_link(hmi, supervisor_switch, self.data['hmi'])
+
         # -- ATACKERS -- #
         if 'network_attacks' in self.data.keys():
             # Add attackers to the mininet network
@@ -253,6 +271,9 @@ class SimpleTopo(Topo):
 
         # Set the default gateway of the SCADA
         net.get('scada').cmd('route add default gw ' + self.supervisor_ip)
+
+        # Set the default gateway of the HMI
+        net.get('hmi').cmd('route add default gw ' + self.supervisor_ip)
 
         # Set default gateway for the attackers
         if 'network_attacks' in self.data.keys():

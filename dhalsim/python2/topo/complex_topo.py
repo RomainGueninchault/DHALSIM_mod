@@ -134,6 +134,25 @@ class ComplexTopo(Topo):
 
         index += 1
 
+        # HMI gets its own subnet like the SCADA (level 2 Purdue, isolated subnetwork)
+        data['hmi'] = {}
+        hmi = data['hmi']
+        hmi['name'] = 'hmi'
+        hmi['local_ip'] = self.local_plc_ips
+        hmi['public_ip'] = '10.0.' + str(index) + '.1'
+        hmi['provider_ip'] = '10.0.' + str(index) + '.254'
+        hmi['provider_mac'] = 'AA:BB:CC:DD:00:' + '{:02x}'.format(index)
+        hmi['mac'] = 'AA:BB:CC:DD:07:' + '{:02x}'.format(index)
+        hmi['interface'] = hmi['name'] + '-eth0'
+        hmi['provider_interface'] = 'r0-eth' + str(index)
+        hmi['gateway_name'] = 'r' + str(index)
+        hmi['switch_name'] = 's' + str(index)
+        hmi['gateway_inbound_mac'] = 'AA:BB:CC:DD:03:' + '{:02x}'.format(index)
+        hmi['gateway_outbound_mac'] = 'AA:BB:CC:DD:04:' + '{:02x}'.format(index)
+        hmi['gateway_ip'] = self.local_router_ips
+
+        index += 1
+
         if 'plcs' in self.data.keys():
             for plc in data["plcs"]:
                 # Store the data in self.data
@@ -195,8 +214,11 @@ class ComplexTopo(Topo):
 
         # -- SCADA -- #
         scada = self.data["scada"]
-
         self.build_for_node(scada, provider_router)
+
+        # -- HMI -- (level 2, own subnet like SCADA)
+        hmi = self.data['hmi']
+        self.build_for_node(hmi, provider_router)
 
         # -- ATACKERS -- #
         if 'network_attacks' in self.data.keys():
@@ -274,8 +296,10 @@ class ComplexTopo(Topo):
                 self.setup_network_for_node(net, plc_data, provider)
 
         scada_data = self.data['scada']
-
         self.setup_network_for_node(net, scada_data, provider)
+
+        hmi_data = self.data['hmi']
+        self.setup_network_for_node(net, hmi_data, provider)
 
         # Set default gateway for the attackers
         if 'network_attacks' in self.data.keys():
