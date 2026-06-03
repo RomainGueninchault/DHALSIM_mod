@@ -202,15 +202,24 @@ class GenericScada(BasePLC):
         self.cache_update_process = None
 
         # Initialise tous les tags _CMD à -1 (valeur neutre)
-        # Les tags _CMD sont dans le serveur cpppo, pas dans SQLite
-        # -> on utilise self.send() vers notre propre IP locale
+        # Retry loop : attend que le serveur cpppo soit prêt avant d'écrire
+        CMD_INIT_TRIES = 20
+        CMD_INIT_SLEEP = 0.5
         scada_local_ip = self.intermediate_yaml['scada']['local_ip']
         for actuator in self.actuator_to_plc_ip:
-            try:
-                self.send((actuator + '_CMD', 1), -1.0, scada_local_ip)
-            except Exception as exc:
-                self.logger.warning('Could not init CMD tag {t}: {e}'.format(
-                    t=actuator + '_CMD', e=exc))
+            cmd_tag = actuator + '_CMD'
+            for attempt in range(CMD_INIT_TRIES):
+                try:
+                    self.send((cmd_tag, 1), -1.0, scada_local_ip)
+                    self.logger.debug('Initialized CMD tag {t} to -1'.format(t=cmd_tag))
+                    break
+                except Exception as exc:
+                    if attempt < CMD_INIT_TRIES - 1:
+                        time.sleep(CMD_INIT_SLEEP)
+                    else:
+                        self.logger.warning(
+                            'Could not init CMD tag {t} after {n} tries: {e}'.format(
+                                t=cmd_tag, n=CMD_INIT_TRIES, e=exc))
 
         time.sleep(sleep)
 
@@ -379,6 +388,11 @@ class GenericScada(BasePLC):
         La comparaison avec -1 est non ambiguë — aucun actuateur physique
         ne peut avoir -1 comme valeur légitime.
         """
+        # Guard : ignorer les premières itérations le temps que tout se stabilise
+        current_clock = int(self.get_master_clock())
+        if current_clock < 2:
+            return
+
         scada_local_ip = self.intermediate_yaml['scada']['local_ip']
         for actuator, plc_ip in self.actuator_to_plc_ip.items():
             cmd_tag = actuator + '_CMD'

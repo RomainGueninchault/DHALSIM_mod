@@ -183,6 +183,27 @@ class GenericHMI(BasePLC):
                 tag=tag, ip=self.scada_ip, exc=exc))
             return None
 
+    def read_all_from_scada(self):
+        """
+        Lit tous les tags du SCADA en une seule requete ENIP via receive_multiple.
+        Beaucoup plus rapide que tag par tag — une seule connexion TCP.
+        Retourne un dict {tag: value} ou {} en cas d'echec.
+        """
+        tags = [(tag, 1) for tag in self.scada_tags]
+        try:
+            values = self.receive_multiple(tags, self.scada_ip)
+            result = {}
+            for tag, val in zip(self.scada_tags, values):
+                try:
+                    result[tag] = float(val)
+                except (TypeError, ValueError):
+                    result[tag] = None
+            return result
+        except Exception as exc:
+            self.logger.warning("HMI could not read_multiple from SCADA ({ip}): {exc}".format(
+                ip=self.scada_ip, exc=exc))
+            return {}
+
     def write_to_scada(self, tag, value):
         """
         Écrit une commande sur le tag _CMD correspondant du serveur ENIP du SCADA.
@@ -202,7 +223,9 @@ class GenericHMI(BasePLC):
     # Évaluation des triggers
     # ------------------------------------------------------------------
 
-    def _should_trigger(self, trigger, current_clock):
+    def _should_trigger(self, trigger, current_clock, scada_values=None):
+        if scada_values is None:
+            scada_values = {}
         t_type = trigger['type'].lower()
 
         if t_type == 'time':
@@ -219,8 +242,11 @@ class GenericHMI(BasePLC):
             if sensor is None or threshold is None:
                 self.logger.warning("Trigger above/below missing sensor or value.")
                 return False
-            # La HMI lit le capteur depuis le SCADA, pas depuis le PLC
-            current_value = self.read_from_scada(sensor)
+            # Utiliser scada_values si disponible, sinon faire un receive() supplementaire
+            if sensor in scada_values and scada_values[sensor] is not None:
+                current_value = scada_values[sensor]
+            else:
+                current_value = self.read_from_scada(sensor)
             if current_value is None:
                 return False
             if t_type == 'above':
@@ -231,14 +257,17 @@ class GenericHMI(BasePLC):
         self.logger.warning("Unknown trigger type: {t}".format(t=t_type))
         return False
 
-    def apply_commands(self, current_clock):
+    def apply_commands(self, current_clock, scada_values=None):
         """
-        Évalue les commandes configurées et envoie celles dont le trigger
-        est satisfait — vers le SCADA, pas vers les PLCs directement.
+        Evalue les commandes configurees et envoie celles dont le trigger
+        est satisfait - vers le SCADA, pas vers les PLCs directement.
+        scada_values : dict {tag: value} deja lu, evite des receive() supplementaires.
         """
+        if scada_values is None:
+            scada_values = {}
         for cmd in self.commands:
             trigger = cmd.get('trigger', {})
-            if not self._should_trigger(trigger, current_clock):
+            if not self._should_trigger(trigger, current_clock, scada_values):
                 continue
 
             actuator = cmd['actuator']
@@ -287,15 +316,16 @@ class GenericHMI(BasePLC):
         while self.hmi_run:
             current_clock = self.get_master_clock()
 
-            # Phase lecture — poll le SCADA uniquement
-            for tag in self.scada_tags:
-                value = self.read_from_scada(tag)
+            # Phase lecture — poll le SCADA en une seule requete receive_multiple
+            scada_values = self.read_all_from_scada()
+            for tag, value in scada_values.items():
                 if value is not None:
                     self.logger.debug('HMI read {tag}={val} from SCADA'.format(
                         tag=tag, val=value))
 
             # Phase écriture — envoie les commandes au SCADA
-            self.apply_commands(current_clock)
+            # On passe scada_values pour eviter des receive() supplementaires dans les triggers
+            self.apply_commands(current_clock, scada_values)
 
             time.sleep(self.HMI_LOOP_SLEEP)
 
