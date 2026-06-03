@@ -362,6 +362,17 @@ class GenericScada(BasePLC):
                             self.cache.loc[clock, self.simple_plc_data[plc_ip]] = values_float
                             self.cache.loc[clock, 'iteration'] = clock
                             self.updated_plc[plc_ip] = True
+
+                        # Pousser les valeurs fraîches sur le serveur ENIP du SCADA
+                        # pour que la HMI puisse les lire via receive()
+                        scada_local_ip = self.intermediate_yaml['scada']['local_ip']
+                        for tag, value in zip(self.simple_plc_data[plc_ip], values_float):
+                            try:
+                                self.send((tag, 1), value, scada_local_ip)
+                            except Exception as send_exc:
+                                self.logger.warning(
+                                    'SCADA could not update ENIP tag {t}: {e}'.format(
+                                        t=tag, e=send_exc))
                 except Exception as e:
                     self.logger.error(
                         "PLC receive_multiple with tags {tags} from {ip} failed with exception '{e}'".format(
