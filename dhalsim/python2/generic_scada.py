@@ -203,8 +203,8 @@ class GenericScada(BasePLC):
 
         # Initialise tous les tags _CMD à -1 (valeur neutre)
         # Retry loop : attend que le serveur cpppo soit prêt avant d'écrire
-        CMD_INIT_TRIES = 20
-        CMD_INIT_SLEEP = 0.5
+        CMD_INIT_TRIES = 5
+        CMD_INIT_SLEEP = 0.1
         scada_local_ip = self.intermediate_yaml['scada']['local_ip']
         for actuator in self.actuator_to_plc_ip:
             cmd_tag = actuator + '_CMD'
